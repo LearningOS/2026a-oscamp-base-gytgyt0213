@@ -88,10 +88,24 @@ impl Tlb {
     ///
     /// 返回匹配条目的 `ppn`，未命中返回 None。
     pub fn lookup(&mut self, vpn: u64, asid: u16) -> Option<u64> {
-        // TODO: 遍历 self.entries，查找 valid && vpn 匹配 && asid 匹配的条目
-        // 命中：self.stats.hits += 1，返回 Some(entry.ppn)
-        // 未命中：self.stats.misses += 1，返回 None
-        todo!()
+        // 线性遍历（真实 TLB 是全相联/组相联的并行比较）。
+        // ASID 必须一起匹配：不同进程可能有相同的 VPN。
+        let hit = self
+            .entries
+            .iter()
+            .find(|e| e.valid && e.vpn == vpn && e.asid == asid)
+            .map(|e| e.ppn);
+
+        match hit {
+            Some(ppn) => {
+                self.stats.hits += 1;
+                Some(ppn)
+            }
+            None => {
+                self.stats.misses += 1;
+                None
+            }
+        }
     }
 
     /// 将一条新映射插入 TLB。
@@ -101,44 +115,70 @@ impl Tlb {
     /// 2. 否则，写入 `fifo_ptr` 指向的位置
     /// 3. 将 `fifo_ptr` 前进到下一个位置（循环：`(fifo_ptr + 1) % capacity`）
     pub fn insert(&mut self, vpn: u64, ppn: u64, asid: u16, flags: u64) {
-        // TODO: 实现 TLB 插入
-        // 提示：
-        //   先查找已有条目：
-        //   for entry in &mut self.entries {
-        //       if entry.valid && entry.vpn == vpn && entry.asid == asid { 更新并返回 }
-        //   }
-        //   写入 fifo_ptr 位置，然后推进指针
-        todo!()
+        // 1. 同一个 (vpn, asid) 已存在则原地更新，不占用新槽位
+        //    （否则 valid_count 会虚高，同一个映射还会出现两份）。
+        for entry in &mut self.entries {
+            if entry.valid && entry.vpn == vpn && entry.asid == asid {
+                entry.ppn = ppn;
+                entry.flags = flags;
+                return;
+            }
+        }
+
+        // 2. 否则写入 fifo_ptr 指向的位置。若该槽位有效，说明它是最早
+        //    填入的，正好被淘汰 —— 这就是 FIFO 策略。
+        self.entries[self.fifo_ptr] = TlbEntry {
+            valid: true,
+            asid,
+            vpn,
+            ppn,
+            flags,
+        };
+
+        // 3. 指针环形前进。
+        self.fifo_ptr = (self.fifo_ptr + 1) % self.capacity;
     }
 
     /// 刷新整个 TLB（将所有条目标记为无效）。
     ///
     /// 这对应于 RISC-V 的 `sfence.vma`（不带参数）操作。
     pub fn flush_all(&mut self) {
-        // TODO: 将所有条目的 valid 设为 false
-        todo!()
+        // sfence.vma（无参数）：全部失效。fifo_ptr 无需复位，
+        // 因为下一次插入会覆盖任意一个已经无效的槽位。
+        for entry in &mut self.entries {
+            entry.valid = false;
+        }
     }
 
     /// 刷新指定虚拟页的 TLB 条目。
     ///
     /// 对应 `sfence.vma vaddr`：只刷新匹配 `vpn` 的条目（任意 ASID）。
     pub fn flush_by_vpn(&mut self, vpn: u64) {
-        // TODO: 将所有 vpn 匹配的条目标记为无效
-        todo!()
+        // sfence.vma vaddr：只针对这一个虚拟页，不限 ASID
+        // —— 页表项被修改后，所有地址空间里该 VPN 的旧缓存都不可信了。
+        for entry in &mut self.entries {
+            if entry.vpn == vpn {
+                entry.valid = false;
+            }
+        }
     }
 
     /// 刷新指定地址空间（ASID）的所有 TLB 条目。
     ///
     /// 对应 `sfence.vma zero, asid`：刷新该 ASID 的所有条目。
     pub fn flush_by_asid(&mut self, asid: u16) {
-        // TODO: 将所有 asid 匹配的条目标记为无效
-        todo!()
+        // sfence.vma zero, asid：某个进程退出/切换地址空间时，
+        // 只需清掉属于它的条目，其它进程的缓存可以保留。
+        for entry in &mut self.entries {
+            if entry.asid == asid {
+                entry.valid = false;
+            }
+        }
     }
 
     /// 返回当前有效条目的数量。
     pub fn valid_count(&self) -> usize {
-        // TODO: 统计 valid == true 的条目数
-        todo!()
+        self.entries.iter().filter(|e| e.valid).count()
     }
 }
 
@@ -193,8 +233,29 @@ impl Mmu {
     /// 4. 页表命中 → 回填 TLB（insert），返回 Some(ppn)
     /// 5. 页表未命中 → 返回 None（缺页）
     pub fn translate(&mut self, vpn: u64) -> Option<u64> {
-        // TODO: 实现 TLB + 页表的二级查找
-        todo!()
+        let asid = self.current_asid;
+
+        // 1. 快路径：TLB 命中直接返回（同时统计 hits/misses）。
+        if let Some(ppn) = self.tlb.lookup(vpn, asid) {
+            return Some(ppn);
+        }
+
+        // 2. 慢路径：遍历页表。
+        let mangling = self
+            .page_table
+            .iter()
+            .find(|(entry_asid, mapping)| *entry_asid == asid && mapping.vpn == vpn);
+
+        match mangling {
+            Some((_, mapping)) => {
+                let (ppn, flags) = (mapping.ppn, mapping.flags);
+                // 3. 回填 TLB，让下一次访问走快路径。
+                self.tlb.insert(vpn, ppn, asid, flags);
+                Some(ppn)
+            }
+            // 页表里也没有 —— 缺页，交给缺页异常处理。
+            None => None,
+        }
     }
 }
 

@@ -39,9 +39,18 @@ impl<T> SpinLock<T> {
     ///
     /// TODO: Spin-wait to acquire lock (compare_exchange), return SpinGuard on success.
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        // TODO: Spin-wait to acquire lock
-        // TODO: Return SpinGuard { lock: self }
-        todo!()
+        loop {
+            if self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                // The guard borrows `self` for its whole lifetime, so the
+                // compiler prevents the guard from outliving the lock.
+                return SpinGuard { lock: self };
+            }
+            std::hint::spin_loop();
+        }
     }
 }
 
@@ -51,7 +60,8 @@ impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // Safety: holding the guard means holding the lock.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -59,7 +69,9 @@ impl<T> Deref for SpinGuard<'_, T> {
 // Return &mut T
 impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        // `&mut self` proves this is the only live borrow of the guard, so
+        // handing out the sole `&mut T` is sound.
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -67,7 +79,10 @@ impl<T> DerefMut for SpinGuard<'_, T> {
 // Set lock.locked to false (Release ordering)
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Release: the guard's writes become visible to the next acquirer.
+        // This runs on normal scope exit *and* during unwinding, which is
+        // what makes the guard panic-safe.
+        self.lock.locked.store(false, Ordering::Release);
     }
 }
 

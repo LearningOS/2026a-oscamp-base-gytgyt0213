@@ -33,7 +33,18 @@ impl Future for CountDown {
     type Output = &'static str;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+        // `CountDown` is `Unpin`, so `get_mut` is safe; it turns the pinned
+        // reference into an ordinary `&mut Self` we can mutate.
+        let this = self.get_mut();
+        if this.count == 0 {
+            Poll::Ready("liftoff!")
+        } else {
+            this.count -= 1;
+            // Tell the executor "I am not done, poll me again". Without this
+            // the task would be parked forever.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
     }
 }
 
@@ -57,7 +68,16 @@ impl Future for YieldOnce {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+        let this = self.get_mut();
+        if this.yielded {
+            // Second poll: the state machine is finished.
+            Poll::Ready(())
+        } else {
+            // First poll: record that we yielded, ask to be polled again.
+            this.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
     }
 }
 

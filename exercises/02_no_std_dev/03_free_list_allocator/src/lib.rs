@@ -108,30 +108,65 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());
 
-        // TODO: Step 1 — traverse free_list, find a suitable block (first-fit)
+        // Step 1 — first-fit search over the free list.
         //
-        // Hints:
-        // - Use prev_ptr and curr to traverse the list
-        // - Check if curr address satisfies align, and (*curr).size >= size
-        // - If found, remove it from the list (update prev's next or the free_list head)
-        // - Return curr as *mut u8
+        // The list is singly linked, so we keep the *previous* node too:
+        // removing a node means patching the predecessor's `next` (or the
+        // list head, when the victim is the first node).
+        let mut prev: *mut FreeBlock = null_mut();
+        let mut curr = self.free_list_head();
+        while !curr.is_null() {
+            let block = &*curr;
+            if (curr as usize) % align == 0 && block.size >= size {
+                // Unlink `curr`.
+                if prev.is_null() {
+                    self.set_free_list_head(block.next);
+                } else {
+                    (*prev).next = block.next;
+                }
+                return curr as *mut u8;
+            }
+            prev = curr;
+            curr = block.next;
+        }
 
-        // TODO: Step 2 — no suitable block in free_list, allocate from bump region
-        //
-        // Same logic as 02_bump_allocator's alloc
-        todo!()
+        // Step 2 — nothing reusable, carve a fresh block off the bump region.
+        // Same CAS loop as the bump allocator, so concurrent callers cannot
+        // hand out overlapping memory.
+        use core::sync::atomic::Ordering;
+
+        let mut current = self.bump_next.load(Ordering::SeqCst);
+        loop {
+            let aligned = (current + align - 1) & !(align - 1);
+            let end = match aligned.checked_add(size) {
+                Some(end) => end,
+                None => return null_mut(),
+            };
+            if end > self.heap_end {
+                return null_mut();
+            }
+            match self.bump_next.compare_exchange(
+                current,
+                end,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return aligned as *mut u8,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
 
-        // TODO: Insert the freed block at the head of free_list
-        //
-        // Steps:
-        // 1. Cast ptr to *mut FreeBlock
-        // 2. Write FreeBlock { size, next: current list head }
-        // 3. Update free_list head to ptr
-        todo!()
+        // Intrusive push: the header lives *inside* the freed block itself,
+        // so reclamation costs no extra memory. Callers must never use the
+        // block after freeing it.
+        let block = ptr as *mut FreeBlock;
+        (*block).size = size;
+        (*block).next = self.free_list_head();
+        self.set_free_list_head(block);
     }
 }
 

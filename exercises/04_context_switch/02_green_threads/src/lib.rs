@@ -137,7 +137,26 @@ impl Scheduler {
     ///    `sp` must be 16-byte aligned (e.g. `(stack_top - 16) & !15` to leave headroom).
     /// 3. Push a `GreenThread` with this context, state `Ready`, and `entry` stored for the wrapper to call.
     pub fn spawn(&mut self, entry: extern "C" fn()) {
-        todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        let stack = vec![0u8; STACK_SIZE];
+        let stack_top = stack.as_ptr() as usize + STACK_SIZE;
+
+        let mut ctx = TaskContext::default();
+        // First switch to this thread lands in `thread_wrapper` (via `ret`),
+        // never directly in `entry` — the wrapper is what marks the thread
+        // Finished when the user function returns.
+        ctx.ra = thread_wrapper as *const () as u64;
+        // Leave one 16-byte slot of headroom below the top, as the ABI
+        // expects at function entry.
+        ctx.sp = ((stack_top - 16) & !0xF) as u64;
+
+        self.threads.push(GreenThread {
+            ctx,
+            state: ThreadState::Ready,
+            // The Vec must be kept alive: moving it does not move the
+            // heap allocation, so `stack_top` stays valid.
+            _stack: Some(stack),
+            entry: Some(entry),
+        });
     }
 
     /// Run the scheduler until all threads (except the main one) are `Finished`.
@@ -146,12 +165,70 @@ impl Scheduler {
     /// 2. Loop: if all threads in `threads[1..]` are `Finished`, break; otherwise call `schedule_next()` (which may switch away and later return).
     /// 3. Clear `SCHEDULER` when done.
     pub fn run(&mut self) {
-        todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+        // `yield_now` / `thread_finished` are reached from inside the green
+        // threads and have no `&mut self`, so they find the scheduler through
+        // this global. (Single-threaded use only, hence the test lock.)
+        unsafe { SCHEDULER = self as *mut Scheduler };
+
+        loop {
+            // Thread 0 is the main/caller thread; it never "finishes" here.
+            if self.threads[1..]
+                .iter()
+                .all(|t| t.state == ThreadState::Finished)
+            {
+                break;
+            }
+            // This call switches away and returns only when the main thread
+            // is scheduled again, i.e. after some green thread yielded.
+            self.schedule_next();
+        }
+
+        unsafe { SCHEDULER = std::ptr::null_mut() };
     }
 
     /// Find the next ready thread (starting from `current + 1` round-robin), mark current as `Ready` (if not `Finished`), mark next as `Running`, set `CURRENT_THREAD_ENTRY` if the next thread has an entry, then switch to it.
     fn schedule_next(&mut self) {
-        todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
+        let count = self.threads.len();
+
+        // Round-robin: scan forward from `current`, wrapping around, and take
+        // the first Ready thread. The `+ count` in the first iteration means
+        // the main thread (index 0) is reachable too.
+        let mut next = None;
+        for offset in 1..=count {
+            let idx = (self.current + offset) % count;
+            if self.threads[idx].state == ThreadState::Ready {
+                next = Some(idx);
+                break;
+            }
+        }
+        let next = match next {
+            Some(next) => next,
+            // Nothing runnable: return to the caller so it can re-check.
+            None => return,
+        };
+
+        // Demote the outgoing thread — unless it already finished, in which
+        // case it must stay Finished and can never be picked again.
+        if self.threads[self.current].state != ThreadState::Finished {
+            self.threads[self.current].state = ThreadState::Ready;
+        }
+        self.threads[next].state = ThreadState::Running;
+
+        // Hand the entry point to `thread_wrapper` for this thread's very
+        // first run. `take()` makes it a one-shot: later switches (after a
+        // yield) must resume mid-function, not restart the entry.
+        if let Some(entry) = self.threads[next].entry.take() {
+            unsafe { CURRENT_THREAD_ENTRY = Some(entry) };
+        }
+
+        let old = self.current;
+        self.current = next;
+
+        // Raw pointers instead of two borrows: `switch_context` inspects
+        // both contexts, and the borrow checker cannot express "may alias".
+        let old_ctx = self.threads[old].ctx.as_mut_ptr();
+        let new_ctx = self.threads[next].ctx.as_ptr();
+        unsafe { switch_context(&mut *old_ctx, &*new_ctx) };
     }
 }
 

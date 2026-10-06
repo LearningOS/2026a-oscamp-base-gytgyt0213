@@ -48,42 +48,56 @@ pub trait File: Send + Sync {
 
 /// File descriptor table
 pub struct FdTable {
-    // TODO: Design the internal structure
-    // Hint: use Vec<Option<Arc<dyn File>>>
-    //       the index is the fd number, None means the fd is closed or unallocated
+    // The fd *is* the index into this vector, so lookup is O(1).
+    // `None` marks a slot that is either never-allocated or closed.
+    files: Vec<Option<Arc<dyn File>>>,
 }
 
 impl FdTable {
     /// Create an empty fd table
     pub fn new() -> Self {
-        // TODO
-        todo!()
+        Self { files: Vec::new() }
     }
 
     /// Allocate a new fd, return the fd number.
     ///
     /// Prefers reusing the smallest closed fd number; if no free slot, appends to the end.
     pub fn alloc(&mut self, file: Arc<dyn File>) -> usize {
-        // TODO
-        todo!()
+        // Scanning from 0 gives the lowest free fd, matching the POSIX
+        // requirement that a new fd is the lowest unused descriptor.
+        if let Some(fd) = self.files.iter().position(|slot| slot.is_none()) {
+            self.files[fd] = Some(file);
+            return fd;
+        }
+        // Table is full: grow it and hand out the newly appended index.
+        self.files.push(Some(file));
+        self.files.len() - 1
     }
 
     /// Get the file object for an fd. Returns None if the fd doesn't exist or is closed.
     pub fn get(&self, fd: usize) -> Option<Arc<dyn File>> {
-        // TODO
-        todo!()
+        // `get` guards against out-of-range indices; `clone` bumps the refcount
+        // so the caller keeps the file alive even if the fd is closed meanwhile.
+        self.files.get(fd)?.clone()
     }
 
     /// Close an fd. Returns true on success, false if the fd doesn't exist or is already closed.
     pub fn close(&mut self, fd: usize) -> bool {
-        // TODO
-        todo!()
+        match self.files.get_mut(fd) {
+            // Assigning None drops the Arc; the file object is released once
+            // its last reference goes away.
+            Some(slot) if slot.is_some() => {
+                *slot = None;
+                true
+            }
+            // Missing fd, or one that was already closed.
+            _ => false,
+        }
     }
 
     /// Return the number of currently allocated fds (excluding closed ones)
     pub fn count(&self) -> usize {
-        // TODO
-        todo!()
+        self.files.iter().filter(|slot| slot.is_some()).count()
     }
 }
 

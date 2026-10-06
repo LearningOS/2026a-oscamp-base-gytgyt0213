@@ -40,23 +40,47 @@ impl<T> SpinLock<T> {
     /// # Safety
     /// Caller must ensure `unlock` is called after using the data.
     pub fn lock(&self) -> &mut T {
-        // TODO
-        todo!()
+        loop {
+            // Acquire on success: critical-section writes must not be moved
+            // before the lock is taken. Relaxed on failure is fine — we are
+            // not reading any protected data, only retrying.
+            if self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Safety: we hold the lock, so we are the only one touching
+                // `data`; the caller guarantees a matching `unlock`.
+                return unsafe { &mut *self.data.get() };
+            }
+            // Tell the CPU we are in a spin-wait loop (yields to SMT sibling,
+            // saves power) instead of hammering the cache line.
+            std::hint::spin_loop();
+        }
     }
 
     /// Release lock.
     ///
     /// TODO: Set locked to false (using Release ordering)
     pub fn unlock(&self) {
-        // TODO
-        todo!()
+        // Release: all critical-section writes are visible to the next
+        // thread that acquires the lock.
+        self.locked.store(false, Ordering::Release);
     }
 
     /// Try to acquire lock without spinning.
     /// Returns Some(&mut T) on success, None if lock is busy.
     pub fn try_lock(&self) -> Option<&mut T> {
-        // TODO: Single compare_exchange attempt
-        todo!()
+        // Exactly one attempt; no loop, so it returns immediately when busy.
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(unsafe { &mut *self.data.get() })
+        } else {
+            None
+        }
     }
 }
 

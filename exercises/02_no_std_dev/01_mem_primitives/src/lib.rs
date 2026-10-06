@@ -25,9 +25,17 @@
 /// `dst` and `src` must each point to at least `n` bytes of valid memory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    // TODO: Implement memcpy
-    // Hint: read bytes from src one by one and write to dst
-    todo!()
+    // Byte-at-a-time forward copy. Safe here because the contract says the
+    // two regions never overlap, so overwriting dst cannot destroy src.
+    let mut i = 0;
+    while i < n {
+        // `read` / `write` work on raw pointers: no reference is ever formed,
+        // so aliasing rules are not violated and `n == 0` is a no-op.
+        let byte = src.add(i).read();
+        dst.add(i).write(byte);
+        i += 1;
+    }
+    dst
 }
 
 /// Set `n` bytes starting at `dst` to the value `c`.
@@ -38,8 +46,12 @@ pub unsafe extern "C" fn my_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *m
 /// `dst` must point to at least `n` bytes of valid writable memory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_memset(dst: *mut u8, c: u8, n: usize) -> *mut u8 {
-    // TODO: Implement memset
-    todo!()
+    let mut i = 0;
+    while i < n {
+        dst.add(i).write(c);
+        i += 1;
+    }
+    dst
 }
 
 /// Copy `n` bytes from `src` to `dst`, correctly handling overlapping memory.
@@ -50,9 +62,25 @@ pub unsafe extern "C" fn my_memset(dst: *mut u8, c: u8, n: usize) -> *mut u8 {
 /// `dst` and `src` must each point to at least `n` bytes of valid memory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    // TODO: Implement memmove
-    // Hint: when dst > src and regions overlap, copy backwards (from end to start)
-    todo!()
+    if (dst as usize) <= (src as usize) {
+        // dst is below src (or the two do not overlap): copying low-to-high
+        // only ever writes to bytes we have already read, or to bytes we
+        // will not read at all. Forward copy is safe.
+        let mut i = 0;
+        while i < n {
+            dst.add(i).write(src.add(i).read());
+            i += 1;
+        }
+    } else {
+        // dst is above src and the regions may overlap, so a forward copy
+        // would clobber source bytes before reading them. Walk backwards.
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            dst.add(i).write(src.add(i).read());
+        }
+    }
+    dst
 }
 
 /// Return the length of a null-terminated byte string, excluding the trailing null.
@@ -61,8 +89,12 @@ pub unsafe extern "C" fn my_memmove(dst: *mut u8, src: *const u8, n: usize) -> *
 /// `s` must point to a valid null-terminated byte string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_strlen(s: *const u8) -> usize {
-    // TODO: Implement strlen
-    todo!()
+    let mut len = 0;
+    // Stop at the first NUL byte; it is not counted.
+    while s.add(len).read() != 0 {
+        len += 1;
+    }
+    len
 }
 
 /// Compare two null-terminated byte strings.
@@ -76,8 +108,21 @@ pub unsafe extern "C" fn my_strlen(s: *const u8) -> usize {
 /// `s1` and `s2` must each point to a valid null-terminated byte string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_strcmp(s1: *const u8, s2: *const u8) -> i32 {
-    // TODO: Implement strcmp
-    todo!()
+    let mut i = 0;
+    loop {
+        let a = s1.add(i).read();
+        let b = s2.add(i).read();
+        if a != b {
+            // Only the sign matters for the C contract, so widening the
+            // unsigned bytes to i32 is enough.
+            return a as i32 - b as i32;
+        }
+        if a == 0 {
+            // Both hit the terminator at the same position: equal.
+            return 0;
+        }
+        i += 1;
+    }
 }
 
 // ============================================================

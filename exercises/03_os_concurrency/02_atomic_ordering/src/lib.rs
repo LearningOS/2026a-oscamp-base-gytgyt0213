@@ -38,9 +38,12 @@ impl FlagChannel {
     /// - What Ordering should be used for writing data?
     /// - What Ordering should be used for writing ready? (ensuring data writes are visible to consumer)
     pub fn produce(&self, value: u32) {
-        // TODO: Store data (choose appropriate Ordering)
-        // TODO: Set ready = true (choose appropriate Ordering so data writes complete before this)
-        todo!()
+        // Relaxed is fine for the payload itself: the ordering that matters
+        // is on `ready` below.
+        self.data.store(value, Ordering::Relaxed);
+        // Release: everything written before this store (including `data`)
+        // becomes visible to any thread that reads `ready` with Acquire.
+        self.ready.store(true, Ordering::Release);
     }
 
     /// Consumer: spin-wait for ready flag, then read data.
@@ -49,9 +52,13 @@ impl FlagChannel {
     /// - What Ordering should be used for reading ready? (ensuring it sees data writes from produce)
     /// - What Ordering should be used for reading data?
     pub fn consume(&self) -> u32 {
-        // TODO: Spin-wait for ready to become true (choose appropriate Ordering)
-        // TODO: Read data (choose appropriate Ordering)
-        todo!()
+        // Acquire pairs with the producer's Release store: once we observe
+        // `ready == true`, every write the producer did before it — `data`
+        // included — is guaranteed visible here.
+        while !self.ready.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        self.data.load(Ordering::Relaxed)
     }
 
     /// Reset channel state
@@ -81,15 +88,31 @@ impl OnceCell {
     ///
     /// Hint: use `compare_exchange` to ensure only one thread succeeds.
     pub fn init(&self, val: u32) -> bool {
-        // TODO: Use compare_exchange to ensure initialization only once
-        // Store value on success
-        todo!()
+        // Only one thread can flip false -> true; everyone else gets Err and
+        // reports `false`, so `init` "succeeds" exactly once.
+        match self
+            .initialized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                // Publish the payload *after* winning the race, so a thread
+                // that sees `initialized == true` also sees `value`.
+                self.value.store(val, Ordering::Release);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Get value. Returns Some if initialized, otherwise None.
     pub fn get(&self) -> Option<u32> {
-        // TODO: Check initialized flag, then read value
-        todo!()
+        // Acquire pairs with the Release store above, so reading the flag
+        // first is enough to make `value` safe to read.
+        if self.initialized.load(Ordering::Acquire) {
+            Some(self.value.load(Ordering::Relaxed))
+        } else {
+            None
+        }
     }
 }
 
